@@ -8,6 +8,18 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+// In-memory job store for completed stitches (cleaned up after download or 15min)
+const jobs = new Map();
+setInterval(() => {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const [id, job] of jobs) {
+    if (job.createdAt < cutoff) {
+      try { fs.unlinkSync(job.filePath); } catch {}
+      jobs.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // ── Supabase helpers (credentials passed per-request from frontend) ────────────
 
 function makeSupabaseHelpers(supabaseUrl, supabaseKey) {
@@ -91,6 +103,19 @@ function runFFmpeg(args) {
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, ready: true });
+});
+
+app.get("/api/download/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "File not found or already downloaded." });
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", `attachment; filename="${job.filename}"`);
+  const stream = fs.createReadStream(job.filePath);
+  stream.pipe(res);
+  stream.on("end", () => {
+    try { fs.unlinkSync(job.filePath); } catch {}
+    jobs.delete(req.params.jobId);
+  });
 });
 
 app.post("/api/stitch", async (req, res) => {
@@ -182,15 +207,14 @@ app.post("/api/stitch", async (req, res) => {
       outPath,
     ]);
 
-    // 4. Upload result to Supabase Storage
-    send({ status: "Uploading result…" });
+    // 4. Store finished file for download
     const safe = (comboName || "stitch").replace(/[^a-zA-Z0-9_-]/g, "_");
-    const resultStoragePath = `stitched/${safe}_${Date.now()}.mp4`;
-    await uploadToStorage(outPath, resultStoragePath);
+    const jobId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const keepPath = `/tmp/dl_${jobId}.mp4`;
+    fs.renameSync(outPath, keepPath);
+    jobs.set(jobId, { filePath: keepPath, filename: safe + ".mp4", createdAt: Date.now() });
 
-    // 5. Get 24-hour signed download URL
-    const downloadUrl = await getSignedUrl(resultStoragePath, 86400);
-    send({ status: "done", downloadUrl, filename: safe + ".mp4" });
+    send({ status: "done", jobId, filename: safe + ".mp4" });
     res.end();
 
   } catch (err) {
