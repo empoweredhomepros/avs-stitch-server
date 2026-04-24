@@ -8,42 +8,43 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
+// ── Supabase helpers (credentials passed per-request from frontend) ────────────
 
-// ── Supabase helpers ──────────────────────────────────────────────────────────
-
-async function getSignedUrl(storagePath, expiresIn = 3600) {
-  const resp = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/clips/${storagePath}`, {
-    method: "POST",
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ expiresIn }),
-  });
-  if (!resp.ok) throw new Error(`Failed to get signed URL for ${storagePath}: ${resp.status}`);
-  const data = await resp.json();
-  return `${SUPABASE_URL}/storage/v1${data.signedURL}`;
-}
-
-async function uploadToStorage(filePath, storagePath) {
-  const data = fs.readFileSync(filePath);
-  const resp = await fetch(`${SUPABASE_URL}/storage/v1/object/clips/${storagePath}`, {
-    method: "POST",
-    headers: {
-      apikey: SUPABASE_KEY,
-      Authorization: `Bearer ${SUPABASE_KEY}`,
-      "Content-Type": "video/mp4",
-      "x-upsert": "true",
-    },
-    body: data,
-  });
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Storage upload failed: ${err}`);
+function makeSupabaseHelpers(supabaseUrl, supabaseKey) {
+  async function getSignedUrl(storagePath, expiresIn = 3600) {
+    const resp = await fetch(`${supabaseUrl}/storage/v1/object/sign/clips/${storagePath}`, {
+      method: "POST",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ expiresIn }),
+    });
+    if (!resp.ok) throw new Error(`Failed to get signed URL for ${storagePath}: ${resp.status}`);
+    const data = await resp.json();
+    return `${supabaseUrl}/storage/v1${data.signedURL}`;
   }
+
+  async function uploadToStorage(filePath, storagePath) {
+    const data = fs.readFileSync(filePath);
+    const resp = await fetch(`${supabaseUrl}/storage/v1/object/clips/${storagePath}`, {
+      method: "POST",
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        "Content-Type": "video/mp4",
+        "x-upsert": "true",
+      },
+      body: data,
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(`Storage upload failed: ${err}`);
+    }
+  }
+
+  return { getSignedUrl, uploadToStorage };
 }
 
 // ── File helpers ──────────────────────────────────────────────────────────────
@@ -89,20 +90,16 @@ function runFFmpeg(args) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    hasSupabaseUrl: !!SUPABASE_URL,
-    hasSupabaseKey: !!SUPABASE_KEY,
-    urlPreview: SUPABASE_URL ? SUPABASE_URL.slice(0, 30) + "…" : "not set",
-    keyPreview: SUPABASE_KEY ? SUPABASE_KEY.slice(0, 10) + "…" : "not set",
-  });
+  res.json({ ok: true, ready: true });
 });
 
 app.post("/api/stitch", async (req, res) => {
-  const { clips, comboName } = req.body;
+  const { clips, comboName, supabaseUrl, supabaseKey } = req.body;
 
   if (!clips || !clips.length) return res.status(400).json({ error: "No clips provided" });
-  if (!SUPABASE_URL || !SUPABASE_KEY) return res.status(500).json({ error: "Server not configured — set SUPABASE_URL and SUPABASE_SERVICE_KEY env vars" });
+  if (!supabaseUrl || !supabaseKey) return res.status(400).json({ error: "Missing supabaseUrl or supabaseKey in request" });
+
+  const { getSignedUrl, uploadToStorage } = makeSupabaseHelpers(supabaseUrl, supabaseKey);
 
   // Set up Server-Sent Events
   res.setHeader("Content-Type", "text/event-stream");
@@ -127,13 +124,13 @@ app.post("/api/stitch", async (req, res) => {
       if (clip.storagePath) {
         const url = await getSignedUrl(clip.storagePath);
         await downloadToFile(url, segPath);
-        fromStorage.push(true); // already normalized
+        fromStorage.push(true);
       } else if (clip.driveUrl) {
         const fileId = extractDriveId(clip.driveUrl);
         if (!fileId) throw new Error(`Cannot parse Drive URL for clip ${clip.id}`);
         const directUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`;
         await downloadToFile(directUrl, segPath);
-        fromStorage.push(false); // needs normalization
+        fromStorage.push(false);
       } else {
         throw new Error(`No source for clip "${clip.id}" — upload to Storage or add a Drive URL.`);
       }
@@ -160,7 +157,6 @@ app.post("/api/stitch", async (req, res) => {
             normPath,
           ]);
         } catch {
-          // Fallback: generate silent stereo audio
           await runFFmpeg([
             "-i", segFiles[i],
             "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
