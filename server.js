@@ -105,6 +105,58 @@ app.get("/health", (req, res) => {
   res.json({ ok: true, ready: true });
 });
 
+app.post("/api/normalize", async (req, res) => {
+  const { assetId, clientId, driveUrl, supabaseUrl, supabaseKey } = req.body;
+  if (!assetId || !clientId || !driveUrl || !supabaseUrl || !supabaseKey)
+    return res.status(400).json({ error: "Missing required fields" });
+
+  const { uploadToStorage } = makeSupabaseHelpers(supabaseUrl, supabaseKey);
+  const tmpDir = `/tmp/norm_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  try {
+    const fileId = extractDriveId(driveUrl);
+    if (!fileId) throw new Error("Cannot parse Drive URL");
+
+    const directUrl = `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`;
+    const rawPath = path.join(tmpDir, "raw.mp4");
+    await downloadToFile(directUrl, rawPath);
+
+    const vf = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,fps=30,format=yuv420p";
+    const af = "aresample=44100,aformat=channel_layouts=mono,pan=stereo|c0=c0|c1=c0";
+    const normPath = path.join(tmpDir, "norm.mp4");
+
+    try {
+      await runFFmpeg([
+        "-i", rawPath,
+        "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "26",
+        "-map", "0:v:0", "-map", "0:a:0",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-af", af,
+        normPath,
+      ]);
+    } catch {
+      await runFFmpeg([
+        "-i", rawPath,
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-vf", vf, "-c:v", "libx264", "-preset", "fast", "-crf", "26",
+        "-map", "0:v:0", "-map", "1:a",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2", "-af", af,
+        "-shortest", normPath,
+      ]);
+    }
+
+    const storagePath = `${clientId}/${assetId}.mp4`;
+    await uploadToStorage(normPath, storagePath);
+    res.json({ storagePath });
+
+  } catch (err) {
+    console.error("Normalize error:", err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+});
+
 app.get("/api/download/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "File not found or already downloaded." });
