@@ -89,7 +89,13 @@ function runFFmpeg(args) {
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, supabase: !!(SUPABASE_URL && SUPABASE_KEY) });
+  res.json({
+    ok: true,
+    hasSupabaseUrl: !!SUPABASE_URL,
+    hasSupabaseKey: !!SUPABASE_KEY,
+    urlPreview: SUPABASE_URL ? SUPABASE_URL.slice(0, 30) + "…" : "not set",
+    keyPreview: SUPABASE_KEY ? SUPABASE_KEY.slice(0, 10) + "…" : "not set",
+  });
 });
 
 app.post("/api/stitch", async (req, res) => {
